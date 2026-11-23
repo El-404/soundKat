@@ -5,9 +5,10 @@ edition = "2024"
 
 [dependencies]
 bytemuck = "1.25.2"
-cpal = "0.18.2"
+cpal = { version = "0.18.2", features = ["pulseaudio"] }
 env_logger = "0.11.12"
-mpris = "2.1.0"
 pollster = "1.0.3"
+rustfft = "6.4.1"
+spectrum-analyzer = "2.0.0"
 wgpu = "30.0.2"
 winit = "0.30.13"

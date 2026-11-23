@@ -1,8 +1,11 @@
-use std::sync::Arc;
+mod audio;
 
-use cpal::traits::StreamTrait;
+use std::{sync::{Arc, mpsc::Receiver}, thread::{self, JoinHandle}, time::Duration};
+
 use wgpu::{BindGroup, Buffer, CurrentSurfaceTexture, Device, Queue, Surface, SurfaceConfiguration, SurfaceTexture};
 use winit::{application::ApplicationHandler, dpi::PhysicalSize, event::{self, WindowEvent}, event_loop::{ActiveEventLoop, ControlFlow, EventLoop}, window::Window};
+
+use crate::audio::AudioManager;
 
 
 #[repr(C)]
@@ -13,8 +16,6 @@ struct Uniforms {
     time: f32,
     _pad: f32,
 }
-
-
 struct State {
     surface: Surface<'static>,
     device: Device,
@@ -23,11 +24,12 @@ struct State {
     render_pipeline: wgpu::RenderPipeline,
     uniform_buffer: Buffer,
     bind_group: BindGroup,
-    uniform: Uniforms
+    uniform: Uniforms,
+    audio_manager: Arc<AudioManager>,
 }
 
 impl State {
-    async fn new(window: Arc<Window>) -> State {
+    async fn new(window: Arc<Window>, audio_manager: Arc<AudioManager>) -> State {
         let uniform = Uniforms {
             size: [window.inner_size().width, window.inner_size().height],
             volume: 0,
@@ -186,7 +188,8 @@ impl State {
             render_pipeline: render_pipeline,
             uniform_buffer: uniform_buffer,
             bind_group: bind_group,
-            uniform: uniform
+            uniform: uniform,
+            audio_manager
         }
     }
 
@@ -225,6 +228,9 @@ impl State {
 
     fn render_texture(&mut self, output: SurfaceTexture) {
         self.uniform.time += 0.01;
+        let v = self.audio_manager.get_volumes().expect("Failed to get the volume");
+        println!("{}", v[1] as u32);
+        self.uniform.volume = v[1] as u32;
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[self.uniform]));
         let descriptor = wgpu::TextureViewDescriptor::default();
         let view = output.texture.create_view(&descriptor);
@@ -271,11 +277,13 @@ impl State {
 #[derive(Default)]
 struct App {
     window: Option<Arc<Window>>,
-    state: Option<State>
+    state: Option<State>,
+    audio_manager: Option<Arc<AudioManager>>,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.audio_manager = Some(Arc::new(AudioManager::new().expect("Failed to create an audio manager")));
         let window_attributes = Window::default_attributes()
             .with_title("soundKat")
             .with_transparent(true)
@@ -287,7 +295,7 @@ impl ApplicationHandler for App {
         ;
         self.window = Some(Arc::new(event_loop.create_window(window_attributes).unwrap()));
         self.state = Some(pollster::block_on(
-            State::new(self.window.clone().unwrap())
+            State::new(self.window.clone().unwrap(), self.audio_manager.clone().unwrap())
         ));
     }
 
@@ -326,7 +334,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Wait);
-
 
     let mut app = App::default();
     event_loop.run_app(&mut app)?;
