@@ -1,0 +1,13 @@
+[package]
+name = "soundKat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = "1.25.2"
+cpal = "0.18.2"
+env_logger = "0.11.12"
+mpris = "2.1.0"
+pollster = "1.0.3"
+wgpu = "30.0.2"
+winit = "0.30.13"
