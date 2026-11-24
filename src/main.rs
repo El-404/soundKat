@@ -1,6 +1,6 @@
 mod audio;
 
-use std::{sync::{Arc, mpsc::Receiver}, thread::{self, JoinHandle}, time::Duration};
+use std::{cell::RefCell, rc::Rc, sync::{Arc, mpsc::Receiver}, thread::{self, JoinHandle}, time::Duration};
 
 use wgpu::{BindGroup, Buffer, CurrentSurfaceTexture, Device, Queue, Surface, SurfaceConfiguration, SurfaceTexture};
 use winit::{application::ApplicationHandler, dpi::PhysicalSize, event::{self, WindowEvent}, event_loop::{ActiveEventLoop, ControlFlow, EventLoop}, window::Window};
@@ -12,9 +12,15 @@ use crate::audio::AudioManager;
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
     size: [u32; 2],
-    volume: u32,
     time: f32,
     _pad: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct AudioUniform {
+    frequency: f32,
+    magnitude: f32,
 }
 struct State {
     surface: Surface<'static>,
@@ -23,16 +29,16 @@ struct State {
     config: SurfaceConfiguration,
     render_pipeline: wgpu::RenderPipeline,
     uniform_buffer: Buffer,
+    audio_data_buffer: Buffer,
     bind_group: BindGroup,
     uniform: Uniforms,
-    audio_manager: Arc<AudioManager>,
+    audio_manager: Rc<RefCell<AudioManager>>,
 }
 
 impl State {
-    async fn new(window: Arc<Window>, audio_manager: Arc<AudioManager>) -> State {
+    async fn new(window: Arc<Window>, audio_manager: Rc<RefCell<AudioManager>>) -> State {
         let uniform = Uniforms {
             size: [window.inner_size().width, window.inner_size().height],
-            volume: 0,
             time: 0.0,
             _pad: 0.0,
         };
@@ -113,27 +119,58 @@ impl State {
             mapped_at_creation: false,
         });
 
+        let audio_data: [AudioUniform; 8] = [AudioUniform {
+            frequency: 0.0,
+            magnitude: 0.0,
+        }; 8];
+
+        let audio_data_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Audio Data Buffer"),
+            size: std::mem::size_of::<[AudioUniform; 8]>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&audio_data_buffer, 0, bytemuck::cast_slice(&audio_data));
+
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Screen Bind Layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Screen Bind Group"),
             layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: audio_data_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -188,6 +225,7 @@ impl State {
             render_pipeline: render_pipeline,
             uniform_buffer: uniform_buffer,
             bind_group: bind_group,
+            audio_data_buffer: audio_data_buffer,
             uniform: uniform,
             audio_manager
         }
@@ -201,6 +239,7 @@ impl State {
 
             self.reconfigure_surface();
             self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[self.uniform]));
+        
         }
     }
 
@@ -224,14 +263,32 @@ impl State {
             }
             _ => {}
         };
+
     }
 
     fn render_texture(&mut self, output: SurfaceTexture) {
         self.uniform.time += 0.01;
-        let v = self.audio_manager.get_volumes().expect("Failed to get the volume");
-        println!("{}", v[1] as u32);
-        self.uniform.volume = v[1] as u32;
+        let v = self.audio_manager.borrow_mut().get_volumes().expect("Failed to get the volume");
+
+        let mut audio_data = [AudioUniform {
+            frequency: 0.0,
+            magnitude: 0.0,
+        }; 8];
+
+        for (index, (frequency, magnitude)) in v.iter().take(8).enumerate() {
+            audio_data[index] = AudioUniform {
+                frequency: *frequency,
+                magnitude: magnitude.clamp(0.0, 1.0),
+            };
+        }
+
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[self.uniform]));
+        self.queue.write_buffer(
+            &self.audio_data_buffer,
+            0,
+            bytemuck::cast_slice(&audio_data),
+        );
+
         let descriptor = wgpu::TextureViewDescriptor::default();
         let view = output.texture.create_view(&descriptor);
 
@@ -278,12 +335,14 @@ impl State {
 struct App {
     window: Option<Arc<Window>>,
     state: Option<State>,
-    audio_manager: Option<Arc<AudioManager>>,
+    audio_manager: Option<Rc<RefCell<AudioManager>>>,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        self.audio_manager = Some(Arc::new(AudioManager::new().expect("Failed to create an audio manager")));
+        self.audio_manager = Some(Rc::new(RefCell::new(
+            AudioManager::new().expect("Failed to create an audio manager")
+        )));
         let window_attributes = Window::default_attributes()
             .with_title("soundKat")
             .with_transparent(true)
